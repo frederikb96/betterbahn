@@ -184,6 +184,9 @@ async function getResolvedUrlBrowserless(url: string) {
                   vbidRequest.response.headers.getSetCookie()
                 : (() => {
                       const sc = vbidRequest.response.headers.get("set-cookie");
+                      // If multiple Set-Cookie headers were coalesced into a single string,
+                      // we cannot reliably split by comma because of Expires=...,
+                      // but sending the first header is often enough to pass the recon gate.
                       return sc ? [sc] : [];
                   })();
 
@@ -201,12 +204,19 @@ async function getResolvedUrlBrowserless(url: string) {
             data.verbindungen[0].verbindungsAbschnitte.at(-1)!.halte.at(-1)!.id
         );
     } catch (e) {
-        // Fallback: parse the hinfahrtRecon locally to extract LIDs
-        const { departLid, arrLid } = parseHinfahrtRecon(
-            vbidRequest.data.hinfahrtRecon
-        );
-        hashParams.set("soid", departLid);
-        hashParams.set("zoid", arrLid);
+        // Fallback 1: Try extracting from the HKI section of hinfahrtRecon (simple regex)
+        const hki = extractLidsFromHinfahrtReconHKI(vbidRequest.data.hinfahrtRecon);
+        if (hki) {
+            hashParams.set("soid", hki.departLid);
+            hashParams.set("zoid", hki.arrLid);
+        } else {
+            // Fallback 2: Try the more complex SC JSON parsing
+            const { departLid, arrLid } = parseHinfahrtRecon(
+                vbidRequest.data.hinfahrtRecon
+            );
+            hashParams.set("soid", departLid);
+            hashParams.set("zoid", arrLid);
+        }
     }
 
     // Add date information from the booking if present
@@ -216,4 +226,20 @@ async function getResolvedUrlBrowserless(url: string) {
 
     newUrl.hash = hashParams.toString();
     return newUrl.toString();
+}
+
+function extractLidsFromHinfahrtReconHKI(hinfahrtRecon: string):
+    | { departLid: string; arrLid: string }
+    | null {
+    try {
+        const ids = Array.from(hinfahrtRecon.matchAll(/@L=(\d{7,})/g)).map(
+            (m) => m[1]
+        );
+        if (ids.length >= 2) {
+            return { departLid: ids[0]!, arrLid: ids[1]! };
+        }
+        return null;
+    } catch {
+        return null;
+    }
 }
