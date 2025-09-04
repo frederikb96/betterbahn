@@ -1,5 +1,5 @@
 import { fetchAndValidateJson } from "@/utils/fetchAndValidateJson";
-import { parseHinfahrtReconWithAPI } from "@/utils/parseHinfahrtRecon";
+import { parseHinfahrtRecon, parseHinfahrtReconWithAPI } from "@/utils/parseHinfahrtRecon";
 import { vbidSchema } from "@/utils/schemas";
 import type { ExtractedData } from "@/utils/types";
 import { apiErrorHandler } from "../_lib/error-handler";
@@ -44,24 +44,32 @@ export async function POST(request: Request) {
 }
 
 const extractStationName = (value: string | null) => {
-	if (!value) {
-		return null;
-	}
+    if (!value) return null;
 
-	const oMatch = value.match(/@O=([^@]+)/);
+    // Handle HAFAS LID strings (e.g. "...@O=Aachen Hbf...@L=8000001...")
+    const oMatch = value.match(/@O=([^@]+)/);
+    if (oMatch) {
+        return decodeURIComponent(oMatch[1]).replaceAll("+", " ").trim();
+    }
 
-	if (oMatch) {
-		return decodeURIComponent(oMatch[1]).replaceAll("+", " ").trim();
-	}
+    // If value is just a numeric id, we can't infer the name here
+    if (/^\d+$/.test(value)) return null;
 
-	const parts = value.split("@L=");
-	return parts.length > 0
-		? decodeURIComponent(parts[0]).replaceAll("+", " ").trim()
-		: decodeURIComponent(value);
+    // Fallback: value might be a plain station name or URL-encoded string
+    const parts = value.split("@L=");
+    return parts.length > 0
+        ? decodeURIComponent(parts[0]).replaceAll("+", " ").trim()
+        : decodeURIComponent(value);
 };
 
-const extractStationId = (value: string | null) =>
-	value?.match(/@L=(\d+)/)?.[1] || null;
+const extractStationId = (value: string | null) => {
+    if (!value) return null;
+    // Support both LID strings containing @L=... and plain numeric ids
+    const fromLid = value.match(/@L=(\d+)/)?.[1];
+    if (fromLid) return fromLid;
+    if (/^\d+$/.test(value)) return value;
+    return null;
+};
 
 const parseDateTime = (value: string | null) => {
 	if (!value) {
@@ -152,33 +160,60 @@ function displayJourneyInfo(journeyDetails: ExtractedData) {
 }
 
 async function getResolvedUrlBrowserless(url: string) {
-	const vbid = new URL(url).searchParams.get("vbid");
+    const vbid = new URL(url).searchParams.get("vbid");
 
-	if (!vbid) {
-		throw new Error("No vbid parameter found in URL");
-	}
+    if (!vbid) {
+        throw new Error("No vbid parameter found in URL");
+    }
 
-	const vbidRequest = await fetchAndValidateJson({
-		url: `https://www.bahn.de/web/api/angebote/verbindung/${vbid}`,
-		schema: vbidSchema,
-	});
+    const vbidRequest = await fetchAndValidateJson({
+        url: `https://www.bahn.de/web/api/angebote/verbindung/${vbid}`,
+        schema: vbidSchema,
+    });
 
-	const cookies = vbidRequest.response.headers.getSetCookie();
-	const { data } = await parseHinfahrtReconWithAPI(vbidRequest.data, cookies);
+    // Build the target URL we want to return
+    const newUrl = new URL("https://www.bahn.de/buchung/fahrplan/suche");
+    const hashParams = new URLSearchParams();
 
-	const newUrl = new URL("https://www.bahn.de/buchung/fahrplan/suche");
+    // Try the official recon API first (more reliable when available)
+    try {
+        const getSetCookie =
+            // @ts-expect-error: getSetCookie exists in Node/undici fetch
+            typeof vbidRequest.response.headers.getSetCookie === "function"
+                ? // @ts-ignore
+                  vbidRequest.response.headers.getSetCookie()
+                : (() => {
+                      const sc = vbidRequest.response.headers.get("set-cookie");
+                      return sc ? [sc] : [];
+                  })();
 
-	// Use hash parameters for consistency with DB URLs
-	const hashParams = new URLSearchParams();
-	hashParams.set("soid", data.verbindungen[0].verbindungsAbschnitte.at(0)!.halte.at(0)!.id);
-	hashParams.set("zoid", data.verbindungen[0].verbindungsAbschnitte.at(-1)!.halte.at(-1)!.id);
+        const { data } = await parseHinfahrtReconWithAPI(
+            vbidRequest.data,
+            getSetCookie
+        );
 
-	// Add date information from the booking
-	if (vbidRequest.data.hinfahrtDatum) {
-		hashParams.set("hd", vbidRequest.data.hinfahrtDatum);
-	}
+        hashParams.set(
+            "soid",
+            data.verbindungen[0].verbindungsAbschnitte.at(0)!.halte.at(0)!.id
+        );
+        hashParams.set(
+            "zoid",
+            data.verbindungen[0].verbindungsAbschnitte.at(-1)!.halte.at(-1)!.id
+        );
+    } catch (e) {
+        // Fallback: parse the hinfahrtRecon locally to extract LIDs
+        const { departLid, arrLid } = parseHinfahrtRecon(
+            vbidRequest.data.hinfahrtRecon
+        );
+        hashParams.set("soid", departLid);
+        hashParams.set("zoid", arrLid);
+    }
 
-	newUrl.hash = hashParams.toString();
+    // Add date information from the booking if present
+    if (vbidRequest.data.hinfahrtDatum) {
+        hashParams.set("hd", vbidRequest.data.hinfahrtDatum);
+    }
 
-	return newUrl.toString();
+    newUrl.hash = hashParams.toString();
+    return newUrl.toString();
 }
